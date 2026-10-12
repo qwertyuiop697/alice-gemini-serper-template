@@ -1,3 +1,4 @@
+
 const DEFAULT_MODEL = "openai/gpt-4o-mini";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
@@ -47,7 +48,9 @@ function fitAliceText(value) {
   }
 
   const lastSpace = candidate.lastIndexOf(" ");
-  return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
+  return (
+    lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate
+  ).trim() + "…";
 }
 
 function isSearchIntent(text) {
@@ -58,10 +61,11 @@ function safeHistory(history) {
   if (!Array.isArray(history)) return [];
 
   return history
-    .filter(item =>
-      item &&
-      (item.role === "user" || item.role === "model") &&
-      typeof item.text === "string"
+    .filter(
+      item =>
+        item &&
+        (item.role === "user" || item.role === "model") &&
+        typeof item.text === "string"
     )
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({
@@ -92,6 +96,7 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
+
   if (!key || timeoutMs < 150) return "";
 
   try {
@@ -124,6 +129,7 @@ async function searchWeb(query, timeoutMs) {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
         const link = String(item.link || "").slice(0, 240);
+
         return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
       });
 
@@ -164,14 +170,17 @@ async function askOpenRouter(text, history, searchContext, timeoutMs) {
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
 
-  messages.push({ role: "user", content: prompt });
+  messages.push({
+    role: "user",
+    content: prompt
+  });
 
   const { response, data } = await fetchJson(
     "https://openrouter.ai/api/v1/chat/completions",
     {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${key}`,
+        Authorization: `Bearer ${key}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
@@ -208,7 +217,9 @@ async function askOpenRouter(text, history, searchContext, timeoutMs) {
         : ""
   ).trim();
 
-  if (!answer) throw new Error("OPENROUTER_EMPTY_RESPONSE");
+  if (!answer) {
+    throw new Error("OPENROUTER_EMPTY_RESPONSE");
+  }
 
   return answer;
 }
@@ -230,3 +241,110 @@ function errorForUser(error) {
 
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method === "GET") {
+    return res.status(200).json({
+      ok: true,
+      service: "alice-openrouter-serper",
+      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+    });
+  }
+
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
+  }
+
+  const startedAt = Date.now();
+  const remainingMs = () =>
+    TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+
+  const body =
+    req.body && typeof req.body === "object"
+      ? req.body
+      : {};
+
+  const text = String(
+    body?.request?.command ||
+    body?.request?.original_utterance ||
+    ""
+  ).trim();
+
+  const oldHistory = safeHistory(body?.state?.session?.history);
+
+  if (!text) {
+    return res.status(200).json(
+      aliceResponse(
+        "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+        false,
+        oldHistory
+      )
+    );
+  }
+
+  try {
+    let searchContext = "";
+
+    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+      searchContext = await searchWeb(
+        text,
+        Math.min(
+          SERPER_TIMEOUT_MS,
+          Math.max(0, remainingMs() - 2600)
+        )
+      );
+    }
+
+    const answer = await askOpenRouter(
+      text,
+      oldHistory,
+      searchContext,
+      Math.max(
+        0,
+        Math.min(OPENROUTER_TIMEOUT_MS, remainingMs() - 600)
+      )
+    );
+
+    const history = [
+      ...oldHistory,
+      {
+        role: "user",
+        text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
+      },
+      {
+        role: "model",
+        text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS)
+      }
+    ].slice(-MAX_HISTORY_MESSAGES);
+
+    return res.status(200).json(
+      aliceResponse(answer, false, history)
+    );
+  } catch (error) {
+    const safeError =
+      error?.message === "AbortError"
+        ? new Error("TIME_BUDGET_EXHAUSTED")
+        : error;
+
+    console.warn(
+      "Alice webhook returned a fallback response:",
+      safeError?.message || "unknown error"
+    );
+
+    return res.status(200).json(
+      aliceResponse(errorForUser(safeError), false, oldHistory)
+    );
+  }
+}
+
+export {
+  aliceResponse,
+  fitAliceText,
+  isSearchIntent,
+  safeHistory
+};
